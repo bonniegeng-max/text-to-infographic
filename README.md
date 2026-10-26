@@ -1,47 +1,23 @@
-# Text to Infographic
+# text-to-infographic
 
-`text-to-infographic` v1.1.3 将当前对话中用户已提供的内容组织成单页信息图规格，并可在用户明确要求时返回完整、可复制的独立静态 HTML 源码。
+把文本变成**可编辑、可校验、可安全分享**的单页信息图。
 
-## 适用场景
+- **结构化 plan**：信息图先写成 JSON（schema 见 `schemas/`），改一个块 = 重渲染，不推倒重来；
+- **信息正确校验**：布局语义（飞轮必须闭环、鱼骨只能单头、桑基必须守恒、仪表盘必须有单位）+ 数值可溯源；
+- **chart_family 六布局**：flywheel / fishbone / sankey / pyramid / timeline / dashboard —— 通用模板库不覆盖的专用布局；
+- **安全渲染**：产物为单文件静态 HTML，零 JavaScript、零外部请求、零依赖安装，离线可用、可打印。
 
-- 把现有笔记整理成一页信息图规格。
-- 把已提供的对比材料映射为信息图布局。
-- 基于当前对话中的事实生成独立 HTML 信息图源码。
+## 快速开始
 
-普通摘要、幻灯片、多页报告、图片编辑、数据收集，以及未明确信息图意图的请求不应触发本 Skill。
+```bash
+python3 scripts/validate_infographic_plan.py examples/flywheel-demo.json
+python3 scripts/render_infographic_html.py examples/flywheel-demo.json out.html
+```
 
-## 能力
-
-- 定义传播目标、阅读顺序、章节层级和内容块。
-- 为内容块推荐文本、指标、对比、序列、时间线、矩阵或图解等视觉形式。
-- 给出布局、间距、颜色、字体和无障碍建议。
-- 安排用户已提供的来源注记与署名。
-- 建立展示性主张到已提供内容的简明对应清单。
-- 按明确请求输出仅含 HTML 与内联 CSS 的完整静态文档。
-- 在用户提出打印约束时加入 print-safe 样式。
-
-## 运行与内容边界
-
-- 仅使用当前对话中已提供的内容。
-- 缺失事实、数值、引用、素材和偏好保持未指定。
-- 不读取本地 CSV、JSON 或 Markdown 文件。
-- 不联网研究、抓取数据或补充事实。
-- 不运行浏览器、渲染器、脚本或命令。
-- 不写出文件，不生成 PNG、PDF、Share Pack、evidence sidecar 或 adapter。
-- 不上传、发布、导入飞书或写入白板。
-- HTML 无 JavaScript 主动行为、远程字体、图片、CDN 或其他外部依赖。
-
-## HTML 输出要求
-
-HTML 源码以 `<!doctype html>` 开始，作为一个连续代码块返回；内容严格为一页，保留语义文本、连贯标题与阅读顺序，并避免只用颜色表达含义。
+仅需 Python 3.10+ 标准库。
 
 ## 文档
 
-- [常见问题](docs/faq.md)
-- [标准案例](docs/canonical-cases.md)
-- [GEO 查询评测](docs/geo-evaluation.md)
-- [机器可读 GEO 声明](geo-manifest.json)
-
-## 版本
-
-当前版本：`1.1.3`。
+- SKILL.md —— agent 调用契约
+- docs/校验规则规格 —— A/B/C 三层校验设计
+- CHANGELOG.md —— 版本历史
