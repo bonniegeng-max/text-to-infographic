@@ -23,7 +23,7 @@
       "type": "object",
       "properties": {
         "palette": { "enum": ["terracotta", "ocean", "forest", "ink", "mono"], "default": "terracotta" },
-        "accent": { "type": "string", "pattern": "^#[0-9a-fA-F]{6}$" }
+        "accent": { "type": "string", "pattern": "^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6})$" }
       }
     },
     "blocks": {

@@ -13,6 +13,7 @@
 """
 import json
 import math
+import re
 import sys
 from html import escape
 
@@ -33,6 +34,18 @@ PALETTES = {
 FONT_STACK = ('-apple-system,"PingFang SC","Hiragino Sans GB",'
               '"Microsoft YaHei","Noto Sans CJK SC",sans-serif')
 
+# 唯一允许的颜色格式：#RGB 或 #RRGGBB（纯十六进制，天然不含任何可注入字符）。
+# 与 schemas/infographic-plan.schema.json 及 validate_infographic_plan.py 保持一致。
+_HEX_COLOR_RE = re.compile(r'^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6})$')
+
+
+def _validate_color(value, field="accent"):
+    """渲染器边界校验：拒绝一切非十六进制颜色，防止 CSS/SVG 注入。"""
+    if not isinstance(value, str) or not _HEX_COLOR_RE.match(value):
+        raise ValueError(
+            f"visual_system.{field} 必须是十六进制颜色（#RGB 或 #RRGGBB），收到: {value!r}")
+    return value
+
 
 def esc(s):
     return escape(str(s), quote=True)
@@ -42,7 +55,8 @@ def palette_of(plan):
     vs = plan.get("visual_system") or {}
     p = dict(PALETTES.get(vs.get("palette", "terracotta"), PALETTES["terracotta"]))
     if vs.get("accent"):
-        p["accent"] = vs["accent"]
+        # 严格校验：accent 会插进 CSS 与 SVG 属性，只放行十六进制颜色，非法直接拒绝渲染。
+        p["accent"] = _validate_color(vs["accent"], "accent")
     return p
 
 
@@ -341,6 +355,7 @@ def render_html(plan):
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; img-src data:; base-uri 'none'; form-action 'none'">
 <title>{esc(meta["title"])}</title>
 <style>
   *{{margin:0;padding:0;box-sizing:border-box}}

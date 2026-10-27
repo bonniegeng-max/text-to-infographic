@@ -1,10 +1,11 @@
 ---
 name: text-to-infographic
-version: 1.2.1
+version: 1.2.2
 description: 将对话或用户提供的内容组织成结构化信息图 plan（JSON），经布局语义与数值一致性校验后，用内置渲染器产出自包含静态 HTML 信息图。支持飞轮/鱼骨/桑基/金字塔/时间线/仪表盘六种 chart_family 布局。仅在用户明确请求信息图时调用。
+allowed-tools: Read, Write, Bash
 ---
 
-# Text to Infographic v1.2.1
+# Text to Infographic v1.2.2
 
 把内容压缩为**可编辑的结构化 plan**，校验信息正确性，再渲染为**零依赖、零脚本、零外链**的静态 HTML 信息图。
 

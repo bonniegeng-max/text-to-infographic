@@ -16,6 +16,7 @@ import sys
 
 ERROR, WARN, INFO = "ERROR", "WARN", "INFO"
 LAYOUTS = {"flywheel", "fishbone", "sankey", "pyramid", "timeline", "dashboard"}
+HEX_COLOR_RE = re.compile(r'^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6})$')
 TEMPORAL_WORDS = ("先", "然后", "接着", "随后", "之后", "再", "最终", "导致", "因此", "从而")
 TIME_PAT = re.compile(r"(\d{4}|\d{1,2}月|\d{1,2}日|Q[1-4]|第\s*[一二三四五六七八九十\d]+\s*[步周月阶段天年]|周[一二三四五六日末]|早期|中期|后期|现在|未来)")
 
@@ -31,6 +32,11 @@ def check(plan, findings):
         findings.append(ERROR, "version 必须为 1.0")
     if layout not in LAYOUTS:
         findings.append(ERROR, f"layout 必须是 {sorted(LAYOUTS)} 之一")
+    # ---- 安全：accent 颜色只放行十六进制（与渲染器边界一致，防止 CSS/SVG 注入）
+    vs = plan.get("visual_system") or {}
+    if vs.get("accent") is not None:
+        if not isinstance(vs["accent"], str) or not HEX_COLOR_RE.match(vs["accent"]):
+            findings.append(ERROR, f"visual_system.accent 必须是十六进制颜色（#RGB 或 #RRGGBB），收到: {vs['accent']!r}")
     if len(blocks) < 2:
         findings.append(ERROR, "blocks 至少 2 个")
     if len(ids) != len(set(ids)):
