@@ -1,13 +1,11 @@
 # Changelog
+## 1.2.4 — 2026-11-17
 
-## 1.2.2 (2026-10-27)
+发布面修正，无功能变更。
 
-- 安全修复：`visual_system.accent` 之前直接插值进 CSS/SVG，可被构造值注入脚本/事件处理器/外链，违背「零脚本、零外链」承诺
-- 渲染器边界严格校验：accent 只接受十六进制颜色（#RGB / #RRGGBB），非法值拒绝渲染
-- 校验器同步拦截非法 accent（与 schema、渲染器三处一致）
-- 产物 `<head>` 增加 CSP（`default-src 'none'`）阻断脚本与外部请求，双保险
-- 新增回归测试 `scripts/test_render_security.py`（闭合标签/属性 breakout/CSS URL 等注入用例）
-- SKILL.md 声明 `allowed-tools: Read, Write, Bash` 澄清工具边界
+- **首屏重写**：首屏从 126 字补到 280 字 + 补语义 tag
+- **显示名**：发布时必须带 `--name "Text to Infographic · 文字转信息图"`（此前未能稳定带中文名）
+- **检索面**：tags 刷新到 1.2.4 并补齐语义 tag（`infographic,diagram,timeline,html,visualization`）；topics 同步为 `信息图,数据可视化,infographic,流程图,关系图`
 
 ## 1.2.1 (2026-10-24)
 
