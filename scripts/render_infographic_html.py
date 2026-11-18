@@ -7,12 +7,24 @@
 - 零依赖：仅 Python 标准库，无 pip 安装；
 - 中文优先字体栈，print-safe。
 
+v1.4.0（B 方向）新增可选 `--png`：调用本机已有浏览器截图出 PNG（小红书/公众号直发）。
+- 可选能力：不安装任何浏览器；找不到就报错退出，**HTML 主路径不受影响**；
+- 产物契约不变：PNG 由 HTML 截图而来，页面本身仍是零 JS 零外链。
+
 用法:
-    python3 render_infographic_html.py plan.json [out.html]
+    python3 render_infographic_html.py plan.json [out.html] [--png [OUT.png]] [--scale N]
     cat plan.json | python3 render_infographic_html.py - out.html
+    python3 render_infographic_html.py plan.json out.html --png    # 同目录同名 .png
+
+--png 相关：
+    --png            出 PNG（省略值时用 out.html 同目录同名 .png；stdout 模式下不可省略）
+    --scale N        像素密度倍数（默认 2，即 2x 图）
+    --width N        视口宽（默认 852 = 卡片 820 + 页边距 32）
+    --chrome PATH    显式指定浏览器路径（也可用环境变量 CHROME_PATH）
 """
 import json
 import math
+import re
 import sys
 from html import escape
 
@@ -28,10 +40,33 @@ PALETTES = {
                     "ink": "#242432", "muted": "#75758A", "line": "#DFDFEA"},
     "mono":       {"accent": "#333333", "accent2": "#8C8C8C", "bg": "#F7F7F7",
                     "ink": "#1A1A1A", "muted": "#777777", "line": "#DDDDDD"},
+    # v1.3.0 新增三个 preset：克制的设计 token，不追求风格数量，追求「一套对的」
+    "editorial":  {"accent": "#BF4520", "accent2": "#E0956B", "bg": "#FAF6EF",
+                    "ink": "#2D3142", "muted": "#8A8578", "line": "#E8DFD0"},
+    "technical":  {"accent": "#2563EB", "accent2": "#93B4F5", "bg": "#F5F7FB",
+                    "ink": "#1E2430", "muted": "#6B7686", "line": "#D9E0EA"},
+    "warm":       {"accent": "#B4632C", "accent2": "#E3B23C", "bg": "#FBF4EC",
+                    "ink": "#3A2E24", "muted": "#8F8172", "line": "#EBDCC9"},
 }
+
+# visual_system 中允许按 token 覆盖的字段 → 渲染器内部键的映射。
+# paper 是用户侧命名（纸面底色），渲染器内部叫 bg。
+TOKEN_KEYS = {"accent": "accent", "ink": "ink", "paper": "bg", "muted": "muted"}
 
 FONT_STACK = ('-apple-system,"PingFang SC","Hiragino Sans GB",'
               '"Microsoft YaHei","Noto Sans CJK SC",sans-serif')
+
+# 唯一允许的颜色格式：#RGB 或 #RRGGBB（纯十六进制，天然不含任何可注入字符）。
+# 与 schemas/infographic-plan.schema.json 及 validate_infographic_plan.py 保持一致。
+_HEX_COLOR_RE = re.compile(r'^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6})$')
+
+
+def _validate_color(value, field="accent"):
+    """渲染器边界校验：拒绝一切非十六进制颜色，防止 CSS/SVG 注入。"""
+    if not isinstance(value, str) or not _HEX_COLOR_RE.match(value):
+        raise ValueError(
+            f"visual_system.{field} 必须是十六进制颜色（#RGB 或 #RRGGBB），收到: {value!r}")
+    return value
 
 
 def esc(s):
@@ -41,8 +76,10 @@ def esc(s):
 def palette_of(plan):
     vs = plan.get("visual_system") or {}
     p = dict(PALETTES.get(vs.get("palette", "terracotta"), PALETTES["terracotta"]))
-    if vs.get("accent"):
-        p["accent"] = vs["accent"]
+    # 严格校验：所有 token 都会插进 CSS 与 SVG 属性，只放行十六进制颜色，非法直接拒绝渲染。
+    for field, key in TOKEN_KEYS.items():
+        if vs.get(field):
+            p[key] = _validate_color(vs[field], field)
     return p
 
 
@@ -54,66 +91,152 @@ def rel_of(plan):
     return plan.get("relations", [])
 
 
+def _fly_pt(cx, cy, r, a):
+    return cx + r * math.cos(a), cy + r * math.sin(a)
+
+
+# 「一列一色」马卡龙配色：蓝/黄/红/绿四主色，用于多主体并列的布局。
+MACARON = ["#3B7DD8", "#D9A520", "#C0392B", "#3E8E5A"]
+MACARON_LIGHT = ["#E8F1FB", "#FDF3DC", "#FBE3E3", "#E8F4EC"]
+
+
+def _macaron(i):
+    return MACARON[i % len(MACARON)], MACARON_LIGHT[i % len(MACARON_LIGHT)]
+
+
+def _wrap_text(t, max_chars):
+    """按最大字符数把文本切成多行（硬切，兼容 CJK）。"""
+    if not t:
+        return []
+    lines = []
+    while len(t) > max_chars:
+        lines.append(t[:max_chars])
+        t = t[max_chars:]
+    if t:
+        lines.append(t)
+    return lines
+
+
 # ---------------------------------------------------------------- flywheel
 def render_flywheel(plan, p):
+    """飞轮：中心圆盘（标题+副标题）+ N 个外围节点（标题+描述）+ 闭环箭头。
+
+    v1.5.0 增强（相比早期「四瓣圆环」版本）：
+    - 每个 block 的 title 与 text（描述）都渲染出来；
+    - 中心放一块圆盘承载 meta.title / subtitle；
+    - 节点之间用带箭头的圆弧相连，形成明确的闭环因果，而非色块拼缝。
+    """
     blocks = blocks_of(plan)
     n = len(blocks)
-    cx = cy = 260.0
-    r_out, r_in = 190.0, 120.0
-    arcs, labels, arrows = [], [], []
+    node_w, node_h = 204.0, 74.0
+    gap = 16.0              # 节点色块与圆环之间的留白
+    ring_r = 150.0          # 中心圆盘到圆环的半径（圆环在节点内侧）
+    node_r = ring_r + node_h / 2 + gap   # 节点中心到圆心的距离（色块完全在环外）
+    W = 820
+    outer = node_r + node_h / 2
+    H = max(600, int(2 * (outer + 40)))
+    cx, cy = W / 2, H / 2
+    parts = []
 
+    # 1) 外围节点（放在圆环外侧，色块不与圆环相交）
     for i, b in enumerate(blocks):
-        a0 = -math.pi / 2 + 2 * math.pi * i / n
-        a1 = -math.pi / 2 + 2 * math.pi * (i + 1) / n
+        ang = -math.pi / 2 + 2 * math.pi * i / n
+        nx = cx + node_r * math.cos(ang)
+        ny = cy + node_r * math.sin(ang)
         fill = p["accent"] if i % 2 == 0 else p["accent2"]
+        x0, y0 = nx - node_w / 2, ny - node_h / 2
+        parts.append(
+            f'<rect x="{x0:.1f}" y="{y0:.1f}" width="{node_w}" height="{node_h}" rx="12" '
+            f'fill="{fill}" stroke="#fff" stroke-width="2"/>')
+        # 序号圆点
+        parts.append(
+            f'<circle cx="{x0 + 18:.1f}" cy="{ny:.1f}" r="11" fill="#fff" opacity="0.9"/>')
+        parts.append(
+            f'<text x="{x0 + 18:.1f}" y="{ny + 4:.1f}" text-anchor="middle" font-size="12" '
+            f'font-weight="700" fill="{fill}">{i + 1}</text>')
+        # 标题
+        parts.append(
+            f'<text x="{x0 + 38:.1f}" y="{ny - 14:.1f}" text-anchor="start" font-size="15" '
+            f'font-weight="700" fill="#fff">{esc(b["title"])}</text>')
+        # 描述（按节点可用宽度自动换行，最多两行）
+        if b.get("text"):
+            max_chars = 13
+            t = b["text"]
+            lines = []
+            while len(t) > max_chars:
+                lines.append(t[:max_chars])
+                t = t[max_chars:]
+            if t:
+                lines.append(t)
+            lines = lines[:2]
+            y = ny + 6
+            for ln in lines:
+                shown = ln if len(ln) <= max_chars else ln[:max_chars - 1] + "…"
+                parts.append(
+                    f'<text x="{x0 + 38:.1f}" y="{y:.1f}" text-anchor="start" font-size="11" '
+                    f'fill="#fff" opacity="0.95">{esc(shown)}</text>')
+                y += 15
 
-        def pt(r, a):
-            return cx + r * math.cos(a), cy + r * math.sin(a)
+    # 2) 节点之间的闭环箭头（画在节点之间的空档处，贴着圆环外侧短弧）
+    rels = rel_of(plan)
+    idx = {b["id"]: i for i, b in enumerate(blocks)}
+    for r in rels:
+        i = idx.get(r["from"])
+        j = idx.get(r["to"])
+        if i is None or j is None:
+            continue
+        a_from = -math.pi / 2 + 2 * math.pi * i / n
+        a_to = -math.pi / 2 + 2 * math.pi * j / n
+        if a_to <= a_from:
+            a_to += 2 * math.pi
+        start_a = a_from + 2 * math.pi / n * 0.32
+        end_a = a_to - 2 * math.pi / n * 0.32
+        if end_a <= start_a:
+            end_a = (a_from + a_to) / 2
+        sx, sy = _fly_pt(cx, cy, ring_r, start_a)
+        ex, ey = _fly_pt(cx, cy, ring_r, end_a)
+        large = 1 if (end_a - start_a) > math.pi else 0
+        parts.append(
+            f'<path d="M{sx:.1f},{sy:.1f} A{ring_r},{ring_r} '
+            f'0 {large} 1 {ex:.1f},{ey:.1f}" fill="none" stroke="{p["accent"]}" '
+            f'stroke-width="2.5" marker-end="url(#fw-arrow)"/>')
 
-        x0, y0 = pt(r_out, a0)
-        x1, y1 = pt(r_out, a1)
-        x2, y2 = pt(r_in, a1)
-        x3, y3 = pt(r_in, a0)
-        large = 1 if (a1 - a0) > math.pi else 0
-        arcs.append(
-            f'<path d="M{x0:.1f},{y0:.1f} A{r_out},{r_out} 0 {large} 1 {x1:.1f},{y1:.1f} '
-            f'L{x2:.1f},{y2:.1f} A{r_in},{r_in} 0 {large} 0 {x3:.1f},{y3:.1f} Z" '
-            f'fill="{fill}" stroke="#fff" stroke-width="3"/>')
-
-        # arrow at segment end (clockwise)
-        am = a1 - (a1 - a0) * 0.08
-        xa, ya = pt((r_out + r_in) / 2, am)
-        tang = am + math.pi / 2
-        ah = 14
-        p1 = (xa + ah * math.cos(tang), ya + ah * math.sin(tang))
-        p2 = (xa + 8 * math.cos(tang - math.pi / 2), ya + 8 * math.sin(tang - math.pi / 2))
-        p3 = (xa + 8 * math.cos(tang + math.pi / 2), ya + 8 * math.sin(tang + math.pi / 2))
-        arrows.append(
-            f'<polygon points="{p1[0]:.1f},{p1[1]:.1f} {p2[0]:.1f},{p2[1]:.1f} '
-            f'{p3[0]:.1f},{p3[1]:.1f}" fill="#fff" opacity="0.95"/>')
-
-        am2 = (a0 + a1) / 2
-        lx, ly = pt(r_out + 34, am2)
-        anchor = "middle"
-        if lx > cx + 40:
-            anchor = "start"
-            lx += 6
-        elif lx < cx - 40:
-            anchor = "end"
-            lx -= 6
-        num = f'<tspan fill="{p["muted"]}" font-size="12">{i + 1}. </tspan>'
-        labels.append(
-            f'<text x="{lx:.1f}" y="{ly:.1f}" text-anchor="{anchor}" '
-            f'font-size="15" font-weight="600" fill="{p["ink"]}">{num}{esc(b["title"])}</text>')
-
-    center = (f'<text x="{cx}" y="{cy - 6}" text-anchor="middle" font-size="20" '
-              f'font-weight="700" fill="{p["ink"]}">{esc(plan["meta"]["title"])}</text>')
+    # 3) 中心圆盘
+    center_r = 82.0
+    parts.append(
+        f'<circle cx="{cx}" cy="{cy}" r="{center_r}" fill="#fff" '
+        f'stroke="{p["line"]}" stroke-width="1"/>')
+    title = plan["meta"]["title"]
+    parts.append(
+        f'<text x="{cx}" y="{cy - 6}" text-anchor="middle" font-size="20" '
+        f'font-weight="700" fill="{p["ink"]}">{esc(title)}</text>')
     if plan["meta"].get("subtitle"):
-        center += (f'<text x="{cx}" y="{cy + 18}" text-anchor="middle" font-size="12" '
-                   f'fill="{p["muted"]}">{esc(plan["meta"]["subtitle"])}</text>')
+        sub = plan["meta"]["subtitle"]
+        max_chars = 12
+        slines = []
+        tmp = sub
+        while len(tmp) > max_chars:
+            slines.append(tmp[:max_chars])
+            tmp = tmp[max_chars:]
+        if tmp:
+            slines.append(tmp)
+        slines = slines[:2]
+        y = cy + 20
+        for ln in slines:
+            parts.append(
+                f'<text x="{cx}" y="{y:.1f}" text-anchor="middle" font-size="11" '
+                f'fill="{p["muted"]}">{esc(ln)}</text>')
+            y += 15
 
-    svg = (f'<svg viewBox="0 0 620 520" role="img" style="max-width:620px;width:100%;height:auto">'
-           f'{"".join(arcs)}{"".join(arrows)}{center}{"".join(labels)}</svg>')
+    # 箭头 marker
+    defs = (
+        f'<defs><marker id="fw-arrow" viewBox="0 0 10 10" refX="8" refY="5" '
+        f'markerWidth="6" markerHeight="6" orient="auto">'
+        f'<path d="M2 1L8 5L2 9" fill="none" stroke="{p["accent"]}" '
+        f'stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></marker></defs>')
+
+    svg = (f'<svg viewBox="0 0 {W} {H}" role="img" '
+           f'style="max-width:{W}px;width:100%;height:auto">{defs}{"".join(parts)}</svg>')
     return f'<div class="ig-canvas">{svg}</div>'
 
 
@@ -235,51 +358,57 @@ def render_sankey(plan, p):
 
 # ---------------------------------------------------------------- pyramid
 def render_pyramid(plan, p):
-    """SVG 金字塔：blocks 顺序即层级，第一个 block 为基座（最宽、最深色）。"""
+    """等腰金字塔：blocks 顺序即层级（第一个=基座，最后一个=塔尖）。
+
+    v1.5.0 重写，解决早期版本「层块不对齐、基座画反」的问题：
+    - 严格等腰：中轴固定，每层顶/底边宽线性收缩，塔尖收为顶点；
+    - 一列一色：每层用马卡龙主色（蓝/黄/红/绿），层间无 opacity 混叠；
+    - 层内标题居中；描述文字画在每层右侧，用细引线对齐该层中心。
+    """
     blocks = blocks_of(plan)
     n = len(blocks)
-    LH, GAP = 64, 6                     # 层高 / 层间距
-    shape_w, cx = 560, 290              # 形状区最大宽 / 中轴
-    side_x = cx + shape_w / 2 + 18      # 右侧文字栏起点
-    W, H = 780, n * (LH + GAP) + 60
-    top_y = 30
-
-    def width_at(level_bottom_idx):
-        """第 i 层（0=基座）的底边宽：线性收缩，顶层收为尖。"""
-        return shape_w * (n - level_bottom_idx) / n
+    LH = 72                     # 每层高
+    shape_w = 560               # 基座底边宽
+    cx = 320                    # 中轴（左移，右侧留说明栏）
+    top_y = 20                  # 塔尖 y
+    side_x = 320 + shape_w / 2 + 60   # 右侧说明栏起点
+    W = 820
+    H = top_y + n * LH + 46     # 底部多留白，避免基座被裁切
 
     parts = []
-    for i, b in enumerate(blocks):          # i=0 基座
-        y_top = top_y + (n - 1 - i) * (LH + GAP)   # 基座画在最下
-        wb = width_at(i)
-        wt = width_at(i + 1) if i + 1 < n else 0.0
-        yb, yt = y_top + LH, y_top
-        xlb, xrb = cx - wb / 2, cx + wb / 2
-        xlt, xrt = cx - wt / 2, cx + wt / 2
-        op = 1.0 - 0.55 * (i / max(n - 1, 1))      # 基座最深
+    for i, b in enumerate(blocks):          # i=0 基座（最宽、画在最下），i=n-1 塔尖（最上）
+        w_top = shape_w * (n - 1 - i) / n
+        w_bot = shape_w * (n - i) / n
+        # 基座（i=0）画在最底部：y 从 H 往上数
+        y_bot = H - 46 - i * LH
+        y_top = y_bot - LH
+        xlt = cx - w_top / 2
+        xrt = cx + w_top / 2
+        xlb = cx - w_bot / 2
+        xrb = cx + w_bot / 2
+        main, light = _macaron(i)
+        # 层块（等腰梯形；塔尖层为三角形）
         parts.append(
-            f'<polygon points="{xlt:.1f},{yt} {xrt:.1f},{yt} {xrb:.1f},{yb} {xlb:.1f},{yb}" '
-            f'fill="{p["accent"]}" opacity="{op:.2f}"/>')
-        mid_y = yt + LH / 2 + 5
-        label = f'{i + 1}. {esc(b["title"])}'
-        inner_ok = wb > len(b["title"]) * 17 + 60   # 粗略判断能否放进形状内
-        if inner_ok:
-            parts.append(f'<text x="{cx}" y="{mid_y}" text-anchor="middle" font-size="15" '
-                         f'font-weight="700" fill="#fff">{label}</text>')
-            tx = xrb + 14
-        else:
-            tx = xrt + 14
-        if b.get("text") and tx + 170 < W:
-            parts.append(f'<text x="{tx}" y="{mid_y - 4}" font-size="14" font-weight="600" '
-                         f'fill="{p["ink"]}">{esc(b["title"])}</text>')
-            parts.append(f'<text x="{tx}" y="{mid_y + 15}" font-size="12" '
-                         f'fill="{p["muted"]}">{esc(b["text"][:26])}</text>')
-        elif not inner_ok:
-            parts.append(f'<text x="{tx}" y="{mid_y}" font-size="14" font-weight="600" '
-                         f'fill="{p["ink"]}">{label}</text>')
+            f'<polygon points="{xlt:.1f},{y_top:.1f} {xrt:.1f},{y_top:.1f} '
+            f'{xrb:.1f},{y_bot:.1f} {xlb:.1f},{y_bot:.1f}" '
+            f'fill="{light}" stroke="{main}" stroke-width="1.5"/>')
+        # 层内标题（居中）
+        mid_y = y_top + LH / 2
+        parts.append(f'<text x="{cx}" y="{mid_y + 5:.1f}" text-anchor="middle" '
+                     f'font-size="15" font-weight="700" fill="{main}">'
+                     f'{i + 1}. {esc(b["title"])}</text>')
+        # 右侧说明（text + 引线）
+        if b.get("text"):
+            tx = side_x
+            parts.append(f'<line x1="{xrb + 4:.1f}" y1="{mid_y:.1f}" x2="{tx - 8:.1f}" '
+                         f'y2="{mid_y:.1f}" stroke="{main}" stroke-width="1" '
+                         f'stroke-dasharray="3,3"/>')
+            parts.append(f'<text x="{tx}" y="{mid_y + 4:.1f}" text-anchor="start" '
+                         f'font-size="13" font-weight="600" fill="{p["ink"]}">'
+                         f'{esc(b["text"][:20])}</text>')
 
-    svg = (f'<svg viewBox="0 0 {W} {H}" role="img" style="max-width:{W}px;width:100%;height:auto">'
-           f'{"".join(parts)}</svg>')
+    svg = (f'<svg viewBox="0 0 {W} {H}" role="img" '
+           f'style="max-width:{W}px;width:100%;height:auto">{"".join(parts)}</svg>')
     return f'<div class="ig-canvas">{svg}</div>'
 
 
@@ -314,6 +443,221 @@ def render_dashboard(plan, p):
     return f'<div class="dashboard">{"".join(cards)}</div>'
 
 
+# ---------------------------------------------------------------- comparison
+def render_comparison(plan, p):
+    """对比双栏：按 block.group 分列（左/右），逐条列出 title + text。
+
+    - group 相同 → 同一列，group 顺序即列顺序
+    - 每列一个主题色（马卡龙），标题条用主色，条目用浅色卡
+    """
+    blocks = blocks_of(plan)
+    groups = []
+    for b in blocks:
+        g = b.get("group", "left")
+        if g not in groups:
+            groups.append(g)
+
+    W = 760
+    col_gap = 20
+    col_w = (W - 40 - col_gap * (len(groups) - 1)) / len(groups)
+    max_items = max(len([b for b in blocks if b.get("group", "left") == g])
+                    for g in groups)
+    item_h = 78
+    header_h = 44
+    H = header_h + max_items * item_h + 40
+
+    cols_html = []
+    for gi, g in enumerate(groups):
+        main, light = _macaron(gi)
+        items = [b for b in blocks if b.get("group", "left") == g]
+        x = 20 + gi * (col_w + col_gap)
+        col_title = items[0].get("group_title") or g
+        parts = [f'<rect x="{x:.1f}" y="20" width="{col_w:.1f}" height="{header_h}" '
+                 f'rx="8" fill="{main}"/>']
+        parts.append(
+            f'<text x="{x + col_w / 2:.1f}" y="{20 + header_h / 2 + 5:.1f}" '
+            f'text-anchor="middle" font-size="16" font-weight="700" fill="#fff">'
+            f'{esc(col_title)}</text>')
+        for j, b in enumerate(items):
+            iy = 20 + header_h + 12 + j * item_h
+            parts.append(f'<rect x="{x:.1f}" y="{iy:.1f}" width="{col_w:.1f}" '
+                         f'height="{item_h - 8:.1f}" rx="8" fill="{light}" '
+                         f'stroke="{main}" stroke-width="1"/>')
+            ty = iy + 24
+            parts.append(f'<text x="{x + 14:.1f}" y="{ty:.1f}" text-anchor="start" '
+                         f'font-size="14" font-weight="700" fill="{main}">{esc(b["title"])}</text>')
+            if b.get("text"):
+                lines = _wrap_text(b["text"], int(col_w / 17))
+                for li, ln in enumerate(lines[:3]):
+                    parts.append(
+                        f'<text x="{x + 14:.1f}" y="{ty + 18 + li * 17:.1f}" '
+                        f'text-anchor="start" font-size="12" fill="{p["ink"]}">{esc(ln)}</text>')
+        cols_html.append("".join(parts))
+
+    svg = (f'<svg viewBox="0 0 {W} {H}" role="img" '
+           f'style="max-width:{W}px;width:100%;height:auto">{"".join(cols_html)}</svg>')
+    return f'<div class="ig-canvas">{svg}</div>'
+
+
+# ---------------------------------------------------------------- quadrant
+def render_quadrant(plan, p):
+    """2×2 矩阵：四象限，X/Y 轴标签来自 meta（x_label / y_label），
+    四个 block 按顺序放：左上、右上、左下、右下。
+    """
+    blocks = blocks_of(plan)
+    meta = plan["meta"]
+    W = 680
+    H = 560
+    pad = 90
+    ax_w = W - 2 * pad
+    ax_h = H - 2 * pad
+    cx = pad + ax_w / 2
+    cy = pad + ax_h / 2
+
+    parts = []
+    parts.append(f'<line x1="{cx}" y1="{pad - 8}" x2="{cx}" y2="{pad + ax_h + 8}" '
+                 f'stroke="{p["muted"]}" stroke-width="1.5"/>')
+    parts.append(f'<line x1="{pad - 8}" y1="{cy}" x2="{pad + ax_w + 8}" y2="{cy}" '
+                 f'stroke="{p["muted"]}" stroke-width="1.5"/>')
+    parts.append(f'<polygon points="{cx - 4},{pad - 8} {cx + 4},{pad - 8} {cx},{pad - 20}" '
+                 f'fill="{p["muted"]}"/>')
+    parts.append(f'<polygon points="{pad + ax_w + 8},{cy - 4} {pad + ax_w + 8},{cy + 4} '
+                 f'{pad + ax_w + 20},{cy}" fill="{p["muted"]}"/>')
+    if meta.get("y_label"):
+        parts.append(f'<text x="{cx}" y="{pad - 26}" text-anchor="middle" font-size="13" '
+                     f'font-weight="700" fill="{p["ink"]}">{esc(meta["y_label"])}</text>')
+    if meta.get("x_label"):
+        parts.append(f'<text x="{pad + ax_w + 26}" y="{cy + 4}" text-anchor="start" '
+                     f'font-size="13" font-weight="700" fill="{p["ink"]}">{esc(meta["x_label"])}</text>')
+
+    positions = [
+        (pad + 10, pad + 10, 0),
+        (cx + 10, pad + 10, 1),
+        (pad + 10, cy + 10, 2),
+        (cx + 10, cy + 10, 3),
+    ]
+    qw = ax_w / 2 - 24
+    qh = ax_h / 2 - 24
+    for i, b in enumerate(blocks[:4]):
+        qx, qy, ci = positions[i]
+        main, light = _macaron(ci)
+        parts.append(f'<rect x="{qx:.1f}" y="{qy:.1f}" width="{qw:.1f}" height="{qh:.1f}" '
+                     f'rx="10" fill="{light}" stroke="{main}" stroke-width="1.5"/>')
+        parts.append(f'<text x="{qx + 14:.1f}" y="{qy + 30:.1f}" text-anchor="start" '
+                     f'font-size="15" font-weight="700" fill="{main}">{esc(b["title"])}</text>')
+        if b.get("text"):
+            lines = _wrap_text(b["text"], int(qw / 17))
+            for li, ln in enumerate(lines[:4]):
+                parts.append(
+                    f'<text x="{qx + 14:.1f}" y="{qy + 52 + li * 18:.1f}" text-anchor="start" '
+                    f'font-size="12" fill="{p["ink"]}">{esc(ln)}</text>')
+
+    svg = (f'<svg viewBox="0 0 {W} {H}" role="img" '
+           f'style="max-width:{W}px;width:100%;height:auto">{"".join(parts)}</svg>')
+    return f'<div class="ig-canvas">{svg}</div>'
+
+
+# ---------------------------------------------------------------- flow
+def render_flow(plan, p):
+    """流程步骤：横向步骤卡 + 箭头串联。顺序由 relations 决定，缺省按 blocks 顺序。"""
+    blocks = blocks_of(plan)
+    rels = rel_of(plan)
+    idx = {b["id"]: i for i, b in enumerate(blocks)}
+    order = []
+    if rels:
+        indeg = {b["id"]: 0 for b in blocks}
+        adj = {b["id"]: [] for b in blocks}
+        for r in rels:
+            adj[r["from"]].append(r["to"])
+            indeg[r["to"]] += 1
+        q = [bid for bid, d in indeg.items() if d == 0]
+        while q:
+            cur = q.pop(0)
+            order.append(cur)
+            for nxt in adj[cur]:
+                indeg[nxt] -= 1
+                if indeg[nxt] == 0:
+                    q.append(nxt)
+    if len(order) != len(blocks):
+        order = [b["id"] for b in blocks]
+
+    n = len(order)
+    card_w = 150
+    card_h = 96
+    gap = 44
+    W = 60 + n * card_w + (n - 1) * gap + 60
+    H = 200
+
+    parts = []
+    for i, bid in enumerate(order):
+        b = blocks[idx[bid]]
+        main, light = _macaron(i)
+        x = 60 + i * (card_w + gap)
+        y = (H - card_h) / 2
+        parts.append(f'<rect x="{x:.1f}" y="{y:.1f}" width="{card_w}" height="{card_h}" '
+                     f'rx="12" fill="{light}" stroke="{main}" stroke-width="2"/>')
+        parts.append(f'<circle cx="{x + 18:.1f}" cy="{y + 18:.1f}" r="13" fill="{main}"/>')
+        parts.append(f'<text x="{x + 18:.1f}" y="{y + 23:.1f}" text-anchor="middle" '
+                     f'font-size="13" font-weight="700" fill="#fff">{i + 1}</text>')
+        lines = _wrap_text(b["title"], 8)
+        for li, ln in enumerate(lines[:2]):
+            parts.append(f'<text x="{x + card_w / 2:.1f}" y="{y + 50 + li * 18:.1f}" '
+                         f'text-anchor="middle" font-size="14" font-weight="700" '
+                         f'fill="{p["ink"]}">{esc(ln)}</text>')
+        if b.get("text"):
+            tlines = _wrap_text(b["text"], 10)
+            for li, ln in enumerate(tlines[:2]):
+                parts.append(f'<text x="{x + card_w / 2:.1f}" y="{y + 72 + li * 14:.1f}" '
+                             f'text-anchor="middle" font-size="11" fill="{p["muted"]}">{esc(ln)}</text>')
+        if i < n - 1:
+            ax = x + card_w + 8
+            ay = y + card_h / 2
+            parts.append(f'<line x1="{ax}" y1="{ay}" x2="{ax + gap - 16}" y2="{ay}" '
+                         f'stroke="{p["muted"]}" stroke-width="2"/>')
+            parts.append(f'<polygon points="{ax + gap - 16},{ay - 4} {ax + gap - 16},{ay + 4} '
+                         f'{ax + gap - 4},{ay}" fill="{p["muted"]}"/>')
+
+    svg = (f'<svg viewBox="0 0 {W} {H}" role="img" '
+           f'style="max-width:{W}px;width:100%;height:auto">{"".join(parts)}</svg>')
+    return f'<div class="ig-canvas">{svg}</div>'
+
+
+# ---------------------------------------------------------------- venn
+def render_venn(plan, p):
+    """韦恩图：2-4 个集合圆，标题写在圆上方，交集区半透明。"""
+    blocks = blocks_of(plan)
+    n = len(blocks)
+    W = 680
+    H = 480
+    r = 130
+    if n == 2:
+        centers = [(W / 2 - 80, H / 2), (W / 2 + 80, H / 2)]
+    elif n == 3:
+        centers = [(W / 2, H / 2 - 60), (W / 2 - 90, H / 2 + 50), (W / 2 + 90, H / 2 + 50)]
+    else:
+        centers = [(W / 2 - 70, H / 2 - 50), (W / 2 + 70, H / 2 - 50),
+                   (W / 2 - 70, H / 2 + 50), (W / 2 + 70, H / 2 + 50)]
+
+    parts = []
+    for i, b in enumerate(blocks):
+        main, _ = _macaron(i)
+        cx, cy = centers[i]
+        parts.append(f'<circle cx="{cx:.1f}" cy="{cy:.1f}" r="{r}" fill="{main}" '
+                     f'opacity="0.22" stroke="{main}" stroke-width="2"/>')
+        ty = cy - r - 16
+        parts.append(f'<text x="{cx:.1f}" y="{ty:.1f}" text-anchor="middle" font-size="14" '
+                     f'font-weight="700" fill="{main}">{esc(b["title"])}</text>')
+        if b.get("text"):
+            tlines = _wrap_text(b["text"], 10)
+            for li, ln in enumerate(tlines[:2]):
+                parts.append(f'<text x="{cx:.1f}" y="{cy + li * 16:.1f}" text-anchor="middle" '
+                             f'font-size="11" fill="{p["ink"]}">{esc(ln)}</text>')
+
+    svg = (f'<svg viewBox="0 0 {W} {H}" role="img" '
+           f'style="max-width:{W}px;width:100%;height:auto">{"".join(parts)}</svg>')
+    return f'<div class="ig-canvas">{svg}</div>'
+
+
 RENDERERS = {
     "flywheel": render_flywheel,
     "fishbone": render_fishbone,
@@ -321,6 +665,10 @@ RENDERERS = {
     "pyramid": render_pyramid,
     "timeline": render_timeline,
     "dashboard": render_dashboard,
+    "comparison": render_comparison,
+    "quadrant": render_quadrant,
+    "flow": render_flow,
+    "venn": render_venn,
 }
 
 
@@ -341,6 +689,7 @@ def render_html(plan):
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; img-src data:; base-uri 'none'; form-action 'none'">
 <title>{esc(meta["title"])}</title>
 <style>
   *{{margin:0;padding:0;box-sizing:border-box}}
@@ -390,19 +739,85 @@ def render_html(plan):
 
 
 def main():
-    if len(sys.argv) < 2:
+    args = sys.argv[1:]
+    if not args or args[0] in ("-h", "--help"):
         print(__doc__, file=sys.stderr)
         sys.exit(2)
-    src = sys.argv[1]
+
+    want_png = "--png" in args
+    png_out = None
+    scale, width, chrome_path = 2, 852, None
+    clean = []
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a == "--png":
+            want_png = True
+            nxt = args[i + 1] if i + 1 < len(args) else None
+            if nxt and not nxt.startswith("-"):
+                png_out = nxt            # 显式给了输出路径
+                i += 2
+                continue
+            i += 1
+            continue
+        if a in ("--scale", "--width", "--chrome") and i + 1 < len(args):
+            if a == "--scale":
+                scale = int(args[i + 1])
+            elif a == "--width":
+                width = int(args[i + 1])
+            else:
+                chrome_path = args[i + 1]
+            i += 2
+            continue
+        clean.append(a)
+        i += 1
+
+    if not clean:
+        print(__doc__, file=sys.stderr)
+        sys.exit(2)
+    src = clean[0]
     data = sys.stdin.read() if src == "-" else open(src, encoding="utf-8").read()
     plan = json.loads(data)
     html_out = render_html(plan)
-    if len(sys.argv) > 2 and sys.argv[2] != "-":
-        with open(sys.argv[2], "w", encoding="utf-8") as f:
+
+    out_arg = clean[1] if len(clean) > 1 else None
+    wrote_html = False
+    if out_arg and out_arg != "-":
+        with open(out_arg, "w", encoding="utf-8") as f:
             f.write(html_out)
-        print(f"OK -> {sys.argv[2]}")
+        wrote_html = True
+        print(f"OK -> {out_arg}")
     else:
         sys.stdout.write(html_out)
+
+    if not want_png:
+        return
+
+    # ---- PNG 导出（可选，失败不影响已产出的 HTML）
+    if png_out is None:
+        if out_arg and out_arg != "-":
+            png_out = str(out_arg[:-5] if out_arg.endswith(".html")
+                          else out_arg) + ".png"
+        else:
+            print("--png 需要输出路径（stdout 模式下无法推断）", file=sys.stderr)
+            sys.exit(2)
+    if not wrote_html:                             # stdout 模式：先落临时 HTML 再截图
+        import tempfile
+        with tempfile.NamedTemporaryFile("w", suffix=".html",
+                                         delete=False, encoding="utf-8") as tf:
+            tf.write(html_out)
+            tmp_html = tf.name
+    else:
+        tmp_html = out_arg
+    try:
+        sys.path.insert(0, __file__.rsplit("/", 1)[0])
+        import export_png as EP
+        path, h, _ = EP.export(tmp_html, png_out, width=width, scale=scale,
+                               chrome=chrome_path)
+        print(f"OK -> {path}  ({h * scale}px 高)")
+    except Exception as e:                         # HTML 已经拿到，PNG 失败只提示不中断
+        print(f"[png] 导出失败，不影响已生成的 HTML：\n{e}", file=sys.stderr)
+        sys.exit(3)
 
 
 if __name__ == "__main__":

@@ -13,17 +13,23 @@
         "subtitle": { "type": "string", "maxLength": 60 },
         "goal": { "type": "string" },
         "source_note": { "type": "string" },
-        "footer": { "type": "string" }
+        "footer": { "type": "string" },
+        "x_label": { "type": "string", "maxLength": 20 },
+        "y_label": { "type": "string", "maxLength": 20 }
       }
     },
     "layout": {
-      "enum": ["flywheel", "fishbone", "sankey", "pyramid", "timeline", "dashboard"]
+      "enum": ["flywheel", "fishbone", "sankey", "pyramid", "timeline", "dashboard",
+               "comparison", "quadrant", "flow", "venn"]
     },
     "visual_system": {
       "type": "object",
       "properties": {
-        "palette": { "enum": ["terracotta", "ocean", "forest", "ink", "mono"], "default": "terracotta" },
-        "accent": { "type": "string", "pattern": "^#[0-9a-fA-F]{6}$" }
+        "palette": { "enum": ["terracotta", "ocean", "forest", "ink", "mono", "editorial", "technical", "warm"], "default": "terracotta" },
+        "accent": { "type": "string", "pattern": "^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6})$" },
+        "ink": { "type": "string", "pattern": "^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6})$" },
+        "paper": { "type": "string", "pattern": "^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6})$" },
+        "muted": { "type": "string", "pattern": "^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6})$" }
       }
     },
     "blocks": {
@@ -41,6 +47,7 @@
           "time": { "type": "string" },
           "metric": { "type": "string" },
           "group": { "type": "string" },
+          "group_title": { "type": "string", "maxLength": 24 },
           "role": { "enum": ["head", "cause", "stage", "step"] },
           "source_ref": { "type": "string" }
         }
